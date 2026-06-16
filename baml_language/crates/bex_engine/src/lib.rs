@@ -487,6 +487,7 @@ pub fn cancelled_unhandled_throw() -> EngineError {
     EngineError::UnhandledThrow {
         value: Box::new(BexExternalValue::Instance {
             class_name: CANCELLED_PANIC_CLASS.to_string(),
+            type_args: vec![],
             fields,
         }),
         trace: Vec::new(),
@@ -1808,6 +1809,7 @@ impl BexEngine {
             call_id,
             cancel,
             type_args,
+            named_type_args,
         }: FunctionCallContext,
         copy_objects: bool,
     ) -> Result<BexExternalValue, EngineError> {
@@ -1822,6 +1824,7 @@ impl BexEngine {
                 call_id,
                 cancel,
                 type_args,
+                named_type_args,
             },
             copy_objects,
         )
@@ -1836,6 +1839,7 @@ impl BexEngine {
             call_id,
             cancel,
             type_args,
+            named_type_args,
         }: FunctionCallContext,
         copy_objects: bool,
     ) -> Result<BexExternalValue, EngineError> {
@@ -1944,11 +1948,14 @@ impl BexEngine {
         // `function_index` is the entry function's `HeapPtr`; `type_args` are the
         // explicit BEP-039 type args from the host (closures/bound methods instead
         // seed their captured/class type args — see `call_callable`).
+        // `named_type_args` (host SDK calls) take precedence and are lowered to
+        // positional De Bruijn slots inside `set_entry_point_with_type_args`.
         self.run_entry_point(
             thread,
             function_index,
             vm_args,
             type_args,
+            named_type_args,
             return_type,
             throws_type,
             call_id,
@@ -2013,6 +2020,7 @@ impl BexEngine {
         entry_ptr: HeapPtr,
         vm_args: Vec<Value>,
         type_args: Vec<RuntimeTy>,
+        named_type_args: Vec<(String, RuntimeTy)>,
         return_type: RuntimeTy,
         throws_type: Option<RuntimeTy>,
         call_id: CallId,
@@ -2040,9 +2048,17 @@ impl BexEngine {
                 name: b"",
             });
         }
-        thread
-            .vm
-            .set_entry_point_with_type_args(entry_ptr, &vm_args, type_args);
+        if named_type_args.is_empty() {
+            thread
+                .vm
+                .set_entry_point_with_type_args(entry_ptr, &vm_args, type_args);
+        } else {
+            // Host SDK calls pass named bindings; the VM lowers them to
+            // positional De Bruijn slots against the callee's generic params.
+            thread
+                .vm
+                .set_entry_point_with_named_type_args(entry_ptr, &vm_args, named_type_args);
+        }
 
         // Run the event loop.
         let result = self
@@ -2100,6 +2116,7 @@ impl BexEngine {
             call_id,
             cancel,
             type_args: _,
+            named_type_args: _,
         }: FunctionCallContext,
         copy_objects: bool,
     ) -> Result<BexExternalValue, EngineError> {
@@ -2242,6 +2259,9 @@ impl BexEngine {
             entry,
             vm_args,
             seed_type_args,
+            // Bound-method/closure callables seed class/captured type args
+            // positionally above; no named host bindings on this path.
+            Vec::new(),
             return_type,
             throws_type,
             call_id,

@@ -265,6 +265,7 @@ fn build_callback_args(callback_key: u64, x: i64) -> Vec<u8> {
             },
         ],
         call_id: 0,
+        type_args: vec![],
     };
     args.encode_to_vec()
 }
@@ -381,6 +382,7 @@ fn make_dispatch_error() -> js_sys::Function {
             };
             let inbound = InboundValue {
                 value: Some(InboundVariant::ClassValue(InboundClassValue {
+                    class_ty: None,
                     name: "baml.errors.HostCallable".to_string(),
                     fields: vec![
                         field("message", "test boom"),
