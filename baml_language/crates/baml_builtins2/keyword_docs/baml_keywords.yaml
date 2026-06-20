@@ -140,7 +140,7 @@ generator:
   summary: "Configures code generation for a target language."
   syntax: |
     generator python {
-      output_type "python/pydantic"
+      output_type "python/pydantic2"
       output_dir "../generated"
     }
 
