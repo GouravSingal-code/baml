@@ -1868,11 +1868,14 @@ impl BexEngine {
             });
         let throws_type = self.function_throws_type(function_name);
 
-        // Declared parameter types (TypeVars unsubstituted). Also note whether
-        // this is an instance method (first param `self`): full-binding
-        // enforcement (01pt3) is scoped to *free functions* — instance/static
-        // method binding (where class TypeVars ride the receiver) is Phase 5
-        // (01pt5), so methods keep the permissive path here.
+        // Declared parameter types (TypeVars unsubstituted). Note whether this
+        // is an instance method (first param `self`): full-binding enforcement
+        // (Gate A) is scoped *away* from instance methods, whose class TypeVars
+        // can legitimately stay unconcretized at this stage (recovered from the
+        // receiver below, or lowered to runtime `unknown` when neither the
+        // receiver's wire args nor a `_types=` binding supplies them — see
+        // `WrapperMethods.get_value`). Gate B (the per-arg structural check)
+        // still applies to them.
         let params = self.function_params(function_name)?;
         let has_self_receiver = params.first().is_some_and(|(name, _, _)| *name == "self");
         let declared_param_types: Vec<RuntimeTy> =
@@ -1901,6 +1904,7 @@ impl BexEngine {
                 );
             }
         }
+        let type_args = type_args;
 
         // Always fold the recovered bindings into the return type. This is the
         // pre-existing streaming fix (a generic `self` method's return type
@@ -1921,19 +1925,16 @@ impl BexEngine {
                 .chain(std::iter::once(&return_type))
                 .any(crate::conversion::contains_type_var);
 
-        // Strict generic handling (substitution + full-binding enforcement +
-        // structural arg check) applies to every generic call: all call-level
-        // TypeVar bindings now arrive through the single named `type_args`
-        // channel, and a generic callee with no bindings is rejected by the
-        // full-binding enforcement below.
-        let strict_generics = callee_is_generic;
-        // Full-binding enforcement + per-arg structural check are scoped to
-        // *free* generic functions in Phase 3. Instance methods (a `self`
-        // receiver carrying class TypeVars) are Phase 5; they keep the
-        // permissive path here even though their params are still substituted.
-        let enforce_full_binding = strict_generics && !has_self_receiver;
-
-        let param_types: Vec<RuntimeTy> = if strict_generics {
+        // Strict generic handling applies to every generic call (free
+        // functions, instance methods, static methods); non-generic calls
+        // bypass all of it and keep the existing permissive coercion path.
+        // Two layers:
+        //   • Substitution + Gate B (per-arg structural check, below) run for
+        //     *all* generic calls.
+        //   • Gate A (full-binding enforcement, here) runs for everything
+        //     *except instance methods*, whose class TypeVars can legitimately
+        //     remain unconcretized at this stage (see `has_self_receiver`).
+        let param_types: Vec<RuntimeTy> = if callee_is_generic {
             // Substitute the explicit/recovered bindings into every declared
             // parameter so coercion and validation see concrete types instead
             // of bare TypeVars.
@@ -1942,18 +1943,19 @@ impl BexEngine {
                 .map(|t| crate::conversion::substitute_type_vars(t, &type_args))
                 .collect();
 
-            // The wire must be fully bound (free functions only). Two checks:
-            //   (1) every declared generic param has a binding — catches body-only
-            //       type params (`one_type_arg<T>()`) that never reach the
-            //       signature; and
+            // ── Gate A — full-binding enforcement (not instance methods). The
+            // wire must be fully bound. Two checks:
+            //   (1) every declared generic param has a binding — catches
+            //       body-only type params (`one_type_arg<T>()`) that never reach
+            //       the signature. Scoped to *free functions*: a static method's
+            //       `display_type_params` include the enclosing class params,
+            //       which a static never binds — demanding them *by name* would
+            //       be wrong, so for class methods this check is skipped and the
+            //       method's own params fall to check (2) (they're in the
+            //       signature).
             //   (2) no TypeVar survives substitution in the params/return —
             //       catches a param/return type var the bindings didn't cover.
-            if enforce_full_binding {
-                // Check (1) — declared-param completeness — applies to *free
-                // functions* only. A static method's `display_type_params`
-                // include the enclosing class params (which a static never
-                // binds), so demanding them is wrong; its own params are still
-                // covered by check (2) since they appear in its signature.
+            if !has_self_receiver {
                 let missing_declared = if self.is_class_method(function_name) {
                     None
                 } else {
@@ -1962,7 +1964,6 @@ impl BexEngine {
                         .find(|p| !type_args.contains_key(p.as_str()))
                         .cloned()
                 };
-                // Check (2) — no TypeVar survives substitution in params/return.
                 let unbound = missing_declared.or_else(|| {
                     substituted
                         .iter()
@@ -1990,8 +1991,9 @@ impl BexEngine {
         // `Map`/`Instance`/`Variant` values. Idempotent for already-matching
         // values, so callers that already coerced (e.g. `BexProject::Bex`
         // kwargs entry) aren't double-charged. For a generic call, the now-
-        // concrete `param_types` also drive a structural check that hard-fails
-        // a wire value that doesn't inhabit its expected type (01pt3 item 5).
+        // concrete `param_types` also drive Gate B — a structural check that
+        // hard-fails a wire value that doesn't inhabit its expected type
+        // (01pt3 item 5).
         let args: Vec<BexCallArg> = args
             .into_iter()
             .enumerate()
@@ -1999,7 +2001,7 @@ impl BexEngine {
                 BexCallArg::Provided(value) => {
                     let coerced =
                         crate::conversion::coerce_arg_to_declared_type(*value, &param_types[idx])?;
-                    if enforce_full_binding {
+                    if callee_is_generic {
                         crate::conversion::check_generic_arg(&coerced, &param_types[idx])
                             .map_err(|message| EngineError::TypeMismatch { message })?;
                     }
@@ -2350,7 +2352,10 @@ impl BexEngine {
             .enumerate()
             .map(|(i, ty)| {
                 (
-                    generic_param_names.get(i).cloned().unwrap_or_else(|| i.to_string()),
+                    generic_param_names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| i.to_string()),
                     ty,
                 )
             })
@@ -2541,11 +2546,14 @@ impl BexEngine {
 
     /// Whether `function_name` resolves to a method on a class (its FQN's parent
     /// segment names a registered class), as opposed to a free function. Used to
-    /// scope generic full-binding enforcement: a method's `display_type_params`
-    /// are De Bruijn-ordered as *class params first, then the method's own*, and
-    /// for a **static** method the class params are never bound (no receiver) —
-    /// so the "every declared generic param bound" check would wrongly demand
-    /// them. Free functions have no such prefix.
+    /// scope Gate A's declared-param completeness check (1): a method's
+    /// `display_type_params` are De Bruijn-ordered as *class params first, then
+    /// the method's own*. Gate A only reaches **static** methods (instance
+    /// methods are excluded by `has_self_receiver`), and a static never binds
+    /// those leading class params — so demanding each one appear in `type_args`
+    /// would wrongly reject. Skipping check (1) for class methods leaves the
+    /// static's own params to check (2), which scans the signature. Free
+    /// functions have no such prefix.
     fn is_class_method(&self, function_name: &str) -> bool {
         let Some(resolved) = self.resolve_function_name(function_name) else {
             return false;
